@@ -5,9 +5,19 @@ a telegram bot for renaming files.
 ## features
 
 - file processing capabilities
+- optimized file transfers using FastTelethon
+- centralized file transfer implementation
 - docker support
 - configurable through environment variables or config file
 - modular handler system
+
+## architecture
+
+the bot uses a modular architecture:
+
+- `telegram_file_transfer.py`: core functionality for downloading/uploading files using FastTelethon
+- `handlers/`: message and command handlers
+- `utils/`: utility functions including FastTelethon implementation
 
 ## setup
 

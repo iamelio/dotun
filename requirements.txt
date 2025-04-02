@@ -1,2 +1,4 @@
 telethon
 humanize
+cryptg
+aiohttp[speedups]
