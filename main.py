@@ -1,61 +1,44 @@
 from telethon import TelegramClient, events
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, KeyboardButton, KeyboardButtonRow
+from telethon.tl.custom import Button
 import os
 import logging
 import asyncio
 from configparser import ConfigParser
 from datetime import datetime, timedelta
 import humanize
+import re
+from utils.config import load_config
+from handlers.commands import start_command, help_command
+from handlers.messages import handle_messages, handle_callback
 
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Read configuration
-config = ConfigParser()
-config.read('config.ini')
-
-# Telegram API credentials
-API_ID = config.get('Telegram', 'api_id')
-API_HASH = config.get('Telegram', 'api_hash')
-BOT_TOKEN = config.get('Telegram', 'bot_token')
-SESSION_NAME = 'renamer_bot'
+# Load configuration
+config = load_config()
 
 # Initialize the client
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+client = TelegramClient(config['session_name'],
+                        config['api_id'], config['api_hash'])
+
+# Register command handlers
+client.add_event_handler(start_command, events.NewMessage(pattern='/start'))
+client.add_event_handler(help_command, events.NewMessage(pattern='/help'))
+
+# Register message and callback handlers
+client.add_event_handler(lambda e: handle_messages(
+    e, client), events.NewMessage())
+client.add_event_handler(lambda e: handle_callback(
+    e, client), events.CallbackQuery())
 
 # Dictionary to store pending rename operations
 pending_renames = {}
 
-
-@client.on(events.NewMessage(pattern='/start'))
-async def start_command(event):
-    """Handle the /start command."""
-    await event.respond('Welcome to the File Renamer Bot! 📁✨\n\n'
-                        'Forward me any file, and I\'ll help you rename it.\n'
-                        'To use, simply:\n'
-                        '1. Forward a file to me\n'
-                        '2. Reply to the file with the new name you want\n'
-                        '3. I\'ll send you back the renamed file')
-    raise events.StopPropagation
-
-
-@client.on(events.NewMessage(pattern='/help'))
-async def help_command(event):
-    """Handle the /help command."""
-    await event.respond('📚 **File Renamer Bot Help**\n\n'
-                        'This bot helps you rename any file on Telegram. Here\'s how to use it:\n\n'
-                        '**Commands:**\n'
-                        '/start - Start the bot\n'
-                        '/help - Show this help message\n\n'
-                        '**To rename a file:**\n'
-                        '1. Forward or send a file to this bot\n'
-                        '2. Reply to that file with the new filename\n'
-                        '3. I\'ll process and send back the renamed file\n\n'
-                        '✅ Works with files of any size!\n'
-                        '✅ Preserves file extension if you don\'t specify one')
-    raise events.StopPropagation
+# Dictionary to store active operations
+active_operations = {}
 
 
 def get_file_info(message):
@@ -79,103 +62,20 @@ def get_file_info(message):
     }
 
 
-@client.on(events.NewMessage)
-async def handle_messages(event):
-    """Handle incoming messages."""
-    user_id = event.sender_id
-
-    # Handle file uploads
-    if event.message.media and not event.message.text.startswith('/'):
-        # Get file information
-        file_info = get_file_info(event.message)
-        if not file_info:
-            await event.respond('Sorry, I could not process this file.')
-            return
-
-        # Store the message ID and file info for later reference
-        pending_renames[user_id] = {
-            'message_id': event.message.id,
-            'file_info': file_info
-        }
-
-        # Reply with file information
-        info_text = (
-            f"📄 **File Information**\n\n"
-            f"Name: `{file_info['name']}`\n"
-            f"Size: {humanize.naturalsize(file_info['size'])}\n"
-            f"Type: `{file_info['mime_type']}`\n\n"
-            "Please reply with the new name for the file."
-        )
-        info_msg = await event.respond(info_text, parse_mode='md')
-
-        # Store the info message ID to delete it later
-        pending_renames[user_id]['info_msg_id'] = info_msg.id
-
-    # Handle rename requests
-    elif event.message.is_reply and not event.message.media and not event.message.text.startswith('/'):
-        # Check if this is a reply to a file we're tracking
-        replied_msg = await event.message.get_reply_message()
-
-        if user_id in pending_renames and replied_msg.id == pending_renames[user_id]['message_id']:
-            # This is a rename request
-            new_name = event.message.text.strip()
-
-            # Delete the info message
-            try:
-                await client.delete_messages(event.chat_id, pending_renames[user_id]['info_msg_id'])
-            except Exception as e:
-                logger.error(f"Error deleting info message: {e}")
-
-            # Ask for file type selection
-            file_type_msg = await event.respond(
-                "Please select the output file type:\n\n"
-                "1️⃣ Document (as_file=True)\n"
-                "2️⃣ Original Format (as_file=False)\n\n"
-                "Reply with 1 or 2 to choose."
-            )
-
-            # Store the new name and file type message ID
-            pending_renames[user_id]['new_name'] = new_name
-            pending_renames[user_id]['file_type_msg_id'] = file_type_msg.id
-        else:
-            # Reply to a message that isn't a file we're tracking
-            await event.respond('Please send a file first, then reply to it with the new name.')
-
-    # Handle file type selection
-    elif user_id in pending_renames and 'file_type_msg_id' in pending_renames[user_id]:
-        if event.message.text in ['1', '2']:
-            # Delete the file type selection message
-            try:
-                await client.delete_messages(event.chat_id, pending_renames[user_id]['file_type_msg_id'])
-            except Exception as e:
-                logger.error(f"Error deleting file type message: {e}")
-
-            as_file = event.message.text == '1'
-            status_msg = await event.respond('Starting file processing... Please wait.')
-
-            try:
-                await rename_and_send_file(
-                    event,
-                    await event.client.get_messages(event.chat_id, ids=pending_renames[user_id]['message_id']),
-                    pending_renames[user_id]['new_name'],
-                    status_msg,
-                    as_file
-                )
-                # Clear the pending rename after successful processing
-                del pending_renames[user_id]
-            except Exception as e:
-                logger.error(f"Error renaming file: {e}")
-                await status_msg.edit(f"Sorry, an error occurred while renaming your file: {str(e)}")
-        else:
-            await event.respond('Please reply with either 1 or 2 to select the file type.')
-
-
 async def rename_and_send_file(event, file_message, new_name, status_msg, as_file):
-    """Download, rename, and send back the file."""
+    """download, rename, and send back the file."""
+    user_id = event.sender_id
+    operation_id = f"{user_id}_{file_message.id}"
+    active_operations[operation_id] = {'cancelled': False}
+
     start_time = datetime.now()
     last_update_time = start_time
     downloaded_size = 0
     total_size = file_message.media.document.size
+
+    # Add cancel button to status message
+    keyboard = [[Button.inline("❌ Cancel", "cancel")]]
+    await status_msg.edit("📥 preparing to download...", buttons=keyboard)
 
     def progress_callback(current, total):
         nonlocal downloaded_size, last_update_time
@@ -189,13 +89,15 @@ async def rename_and_send_file(event, file_message, new_name, status_msg, as_fil
 
             progress = (current / total) * 100
             status_text = (
-                f"📥 Downloading...\n\n"
-                f"Progress: {progress:.1f}%\n"
-                f"Downloaded: {humanize.naturalsize(current)} / {humanize.naturalsize(total)}\n"
-                f"Speed: {humanize.naturalsize(speed)}/s\n"
+                f"📥 downloading...\n\n"
+                f"progress: {progress:.1f}%\n"
+                f"downloaded: {humanize.naturalsize(current)} / {humanize.naturalsize(total)}\n"
+                f"speed: {humanize.naturalsize(speed)}/s\n"
                 f"ETA: {humanize.naturaltime(datetime.now() + timedelta(seconds=eta), future=True)}"
             )
-            asyncio.create_task(status_msg.edit(status_text))
+            if not active_operations[operation_id]['cancelled']:
+                asyncio.create_task(status_msg.edit(
+                    status_text, buttons=keyboard))
             last_update_time = current_time
 
     # Get the file
@@ -204,8 +106,12 @@ async def rename_and_send_file(event, file_message, new_name, status_msg, as_fil
         progress_callback=progress_callback
     )
 
+    if active_operations[operation_id]['cancelled']:
+        await status_msg.edit("❌ Download cancelled.")
+        return
+
     if not download_path:
-        await status_msg.edit('Failed to download the file. Please try again.')
+        await status_msg.edit('failed to download the file. please try again.')
         return
 
     # Get original file extension
@@ -223,20 +129,48 @@ async def rename_and_send_file(event, file_message, new_name, status_msg, as_fil
         # Rename the file
         os.rename(download_path, new_path)
 
-        # Update status message
-        await status_msg.edit(f'📤 Uploading "{new_name}"... This might take a while for large files.')
+        # Update status message for upload with cancel button
+        await status_msg.edit(f'📤 preparing to upload "{new_name}"...', buttons=keyboard)
 
-        # Send the renamed file
+        # Create upload progress callback
+        upload_start_time = datetime.now()
+        upload_last_update = upload_start_time
+
+        def upload_progress_callback(current, total):
+            nonlocal upload_last_update
+            current_time = datetime.now()
+
+            # Update progress every 2 seconds
+            if (current_time - upload_last_update).total_seconds() >= 2:
+                speed = current / \
+                    (current_time - upload_start_time).total_seconds()
+                eta = (total - current) / speed if speed > 0 else 0
+                progress = (current / total) * 100
+
+                status_text = (
+                    f"📤 uploading...\n\n"
+                    f"progress: {progress:.1f}%\n"
+                    f"uploaded: {humanize.naturalsize(current)} / {humanize.naturalsize(total)}\n"
+                    f"speed: {humanize.naturalsize(speed)}/s\n"
+                    f"ETA: {humanize.naturaltime(datetime.now() + timedelta(seconds=eta), future=True)}"
+                )
+                if not active_operations[operation_id]['cancelled']:
+                    asyncio.create_task(status_msg.edit(
+                        status_text, buttons=keyboard))
+                upload_last_update = current_time
+
+        # Send the renamed file with upload progress
         await client.send_file(
             event.chat_id,
             new_path,
-            caption=f'Here is your renamed file: **{new_name}**',
+            caption=f'**{new_name}**',
             parse_mode='md',
-            as_file=as_file
+            as_file=as_file,
+            progress_callback=upload_progress_callback
         )
 
-        # Update status message
-        await status_msg.edit('✅ File renamed and uploaded successfully!')
+        if not active_operations[operation_id]['cancelled']:
+            await status_msg.edit('✅ done!', buttons=None)
     except Exception as e:
         logger.error(f"Error in rename_and_send_file: {e}")
         raise
@@ -249,23 +183,25 @@ async def rename_and_send_file(event, file_message, new_name, status_msg, as_fil
                 os.remove(download_path)
         except Exception as e:
             logger.error(f"Error cleaning up files: {e}")
+        # Clean up operation state
+        if operation_id in active_operations:
+            del active_operations[operation_id]
 
 
 async def main():
     """Start the bot."""
+    # Create download directory if it doesn't exist
+    os.makedirs('downloads', exist_ok=True)
+
     # Connect and start the client
-    await client.start(bot_token=BOT_TOKEN)
+    await client.start(bot_token=config['bot_token'])
 
     # Print bot information
     me = await client.get_me()
-    logger.info(f"Bot started as @{me.username}")
+    print(f"Bot started as @{me.username}")
 
     # Run the client until disconnected
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    # Create download directory if it doesn't exist
-    os.makedirs('downloads', exist_ok=True)
-
-    # Run the bot
     asyncio.run(main())

@@ -1,0 +1,5 @@
+[Telegram]
+api_id = YOUR_API_ID
+api_hash = YOUR_API_HASH
+bot_token = YOUR_BOT_TOKEN
+session_name = YOUR_SESSION_NAME
