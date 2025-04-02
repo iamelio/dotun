@@ -1,17 +1,16 @@
 from telethon import events
 from telethon.tl.custom import Button
-from utils.file_handler import get_file_info, FileTransfer, ensure_extension
-import os
 import logging
+import asyncio
 import humanize
+import telegram_file_transfer as tft
+from telethon.tl.types import InputFileLocation
+from telethon.tl.functions.upload import GetFileRequest
 
 logger = logging.getLogger(__name__)
 
 # Dictionary to store pending rename operations
 pending_renames = {}
-
-# Dictionary to store active file transfer operations
-active_operations = {}
 
 
 async def handle_messages(event, client):
@@ -21,7 +20,7 @@ async def handle_messages(event, client):
     # Handle file uploads
     if event.message.media and not event.message.text.startswith('/'):
         # Get file information
-        file_info = get_file_info(event.message)
+        file_info = tft.get_file_info(event.message)
         if not file_info:
             await event.respond('sorry, i could not process this file.')
             return
@@ -82,14 +81,22 @@ async def handle_messages(event, client):
 async def handle_callback(event, client):
     """Handle callback queries (button clicks)."""
     user_id = event.sender_id
+    callback_data = event.data
 
-    # Handle cancel button
-    if event.data.decode() == b'cancel':
-        # Find the active operation for this user
-        for operation_id, operation in active_operations.items():
-            if operation_id.startswith(str(user_id)):
-                operation['cancelled'] = True
-                await event.message.edit('❌ Operation cancelled.')
+    # Handle cancel button for specific operations
+    operation_id = tft.get_operation_id_from_callback(callback_data)
+    if operation_id:
+        if tft.cancel_operation(operation_id):
+            await event.answer('❌ Operation cancelled.')
+        return
+
+    # Handle simple cancel button (legacy)
+    if callback_data == b'cancel':
+        # Look for any operations in the active_operations dict
+        for op_id in list(tft.active_operations.keys()):
+            if op_id.startswith(str(user_id)):
+                tft.cancel_operation(op_id)
+                await event.answer('❌ Operation cancelled.')
                 break
         return
 
@@ -97,78 +104,29 @@ async def handle_callback(event, client):
     if user_id in pending_renames and pending_renames[user_id]['state'] == 'waiting_for_type':
         # Delete the file type selection message
         try:
-            await event.message.delete()
+            await client.delete_messages(event.chat_id, [pending_renames[user_id]['file_type_msg_id']])
         except Exception as e:
             logger.error(f"Error deleting file type message: {e}")
 
-        as_file = event.data.decode() == b'doc'
+        as_file = callback_data == b'doc'
         status_msg = await event.respond('starting file processing... please wait.')
 
         try:
-            await rename_and_send_file(
-                event,
+            # Get the original file message
+            file_message = await event.client.get_messages(event.chat_id, ids=pending_renames[user_id]['message_id'])
+
+            # Use the centralized download_and_rename function
+            await tft.download_and_rename(
                 client,
-                await event.client.get_messages(event.chat_id, ids=pending_renames[user_id]['message_id']),
+                file_message,
                 pending_renames[user_id]['new_name'],
                 status_msg,
                 as_file
             )
+
             # Clear the pending rename after successful processing
             del pending_renames[user_id]
         except Exception as e:
             logger.error(f"Error renaming file: {e}")
             await status_msg.edit(
                 f"sorry, an error occurred while renaming your file: {str(e)}")
-
-
-async def rename_and_send_file(event, client, file_message, new_name, status_msg, as_file):
-    """Download, rename, and send back the file."""
-    # Create file transfer handler
-    transfer = FileTransfer(status_msg, file_message.media.document.size)
-    pending_renames[event.sender_id]['transfer'] = transfer
-
-    # Get the file with progress tracking
-    download_path = await file_message.download_media(
-        'downloads/',
-        progress_callback=transfer.update_progress
-    )
-
-    if not download_path:
-        await status_msg.edit('failed to download the file. please try again.')
-        return
-
-    if transfer.cancelled:
-        return
-
-    # Ensure correct extension
-    new_name = ensure_extension(new_name, download_path)
-    new_path = os.path.join('downloads', new_name)
-
-    try:
-        # Rename the file
-        os.rename(download_path, new_path)
-
-        # Send the renamed file with upload progress
-        await client.send_file(
-            event.chat_id,
-            new_path,
-            caption=f'**{new_name}**',
-            parse_mode='md',
-            as_file=as_file,
-            progress_callback=transfer.update_progress
-        )
-
-        if not transfer.cancelled:
-            await status_msg.edit('done. :)')
-    except Exception as e:
-        logger.error(f"Error in rename_and_send_file: {e}")
-        raise
-    finally:
-        # Clean up files
-        try:
-            if os.path.exists(new_path):
-                os.remove(new_path)
-            if os.path.exists(download_path) and download_path != new_path:
-                os.remove(download_path)
-        except Exception as e:
-            logger.error(f"Error cleaning up files: {e}")
