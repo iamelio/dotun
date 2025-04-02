@@ -37,7 +37,14 @@ def get_file_info(message):
 
 def ensure_extension(new_name, original_path):
     """Ensure the new filename has the correct extension."""
-    _, original_ext = os.path.splitext(original_path)
+    # If original_path is a filename, use it directly
+    if os.path.isfile(original_path):
+        _, original_ext = os.path.splitext(original_path)
+    else:
+        # If it's not a file (might be the original filename string)
+        _, original_ext = os.path.splitext(original_path)
+
+    # If no extension in new name, add the original extension
     if '.' not in new_name:
         new_name += original_ext
     return new_name
@@ -102,6 +109,10 @@ async def download_and_rename(client, file_message, new_name, status_msg, as_fil
     # Create file transfer handler
     transfer = FileTransfer(status_msg, file_message.media.document.size)
 
+    # Get original file info to preserve extension
+    file_info = get_file_info(file_message)
+    original_filename = file_info.get('name', 'Unknown')
+
     # Initialize status message
     await status_msg.edit("📥 starting download...", buttons=transfer.keyboard)
 
@@ -121,11 +132,14 @@ async def download_and_rename(client, file_message, new_name, status_msg, as_fil
             )
 
         if transfer.cancelled:
-            await status_msg.edit("❌ Download cancelled.")
+            await status_msg.edit("❌ download cancelled.")
             return
 
         # Ensure correct extension
-        new_name = ensure_extension(new_name, download_path)
+        _, original_ext = os.path.splitext(original_filename)
+        if '.' not in new_name:
+            new_name += original_ext
+
         new_path = os.path.join('downloads', new_name)
 
         # Rename the file
@@ -144,21 +158,28 @@ async def download_and_rename(client, file_message, new_name, status_msg, as_fil
                     current, total, "📤")
             )
 
+            # Log the filename being used
+            logger.info(f"Sending file with name: {new_name}")
+
+            # Create filename attribute
+            filename_attr = DocumentAttributeFilename(new_name)
+
             # Send the file using the InputFile returned from FastTelethon
             await client.send_file(
                 status_msg.chat_id,
                 input_file,
                 caption=f'**{new_name}**',
                 parse_mode='md',
-                force_document=as_file
+                force_document=as_file,
+                attributes=[filename_attr]
             )
 
         if not transfer.cancelled:
-            await status_msg.edit('✅ done!', buttons=None)
+            await status_msg.edit('done. :)', buttons=None)
     except Exception as e:
         logger.error(f"Error in download_and_rename: {e}")
         if not transfer.cancelled:
-            await status_msg.edit(f"❌ Error: {str(e)}")
+            await status_msg.edit(f"❌ error: {str(e)}")
         raise
     finally:
         # Clean up files
